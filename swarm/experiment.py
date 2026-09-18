@@ -51,6 +51,10 @@ class Experiment:
     # Hardware constraint
     min_memory_gb: float = 0.0
     preferred_tier: str = ""
+    # Mutation tracking
+    parent_experiment_id: str = ""
+    mutation_type: str = ""
+    generation: int = 0
 
     @property
     def memory_gb(self) -> float:
@@ -90,6 +94,9 @@ class ExperimentTracker:
         parent_commit: str = "",
         min_memory_gb: float = 0.0,
         preferred_tier: str = "",
+        generation: int = 0,
+        parent_experiment_id: str = "",
+        mutation_type: str = "",
     ) -> Experiment:
         """Create and register a new experiment."""
         exp_id = self.generate_experiment_id(description)
@@ -104,6 +111,9 @@ class ExperimentTracker:
             parent_commit=parent_commit,
             min_memory_gb=min_memory_gb,
             preferred_tier=preferred_tier,
+            generation=generation,
+            parent_experiment_id=parent_experiment_id,
+            mutation_type=mutation_type,
         )
         self.experiments[exp_id] = exp
         return exp
@@ -262,6 +272,20 @@ class ExperimentTracker:
             )
         except subprocess.CalledProcessError:
             pass
+
+    def get_history(self) -> list[Experiment]:
+        """Return list of completed experiments ordered by creation time."""
+        return [
+            exp
+            for exp in self.experiments.values()
+            if exp.status
+            in (
+                ExperimentStatus.SUCCESS,
+                ExperimentStatus.CRASH,
+                ExperimentStatus.TIMEOUT,
+                ExperimentStatus.DISCARDED,
+            )
+        ]
 
     def summary(self) -> dict:
         """Return a summary of all experiments."""

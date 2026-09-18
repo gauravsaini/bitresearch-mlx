@@ -1,17 +1,14 @@
 """
 Worker daemon — runs on each Apple Silicon Mac in the swarm.
 Connects to the coordinator via WebSocket, receives experiment assignments,
-executes train.py locally, and reports results back.
+executes train.py locally via TrainRunner, and reports results back.
 """
 
 import asyncio
 import json
 import logging
 import os
-import re
 import signal
-import subprocess
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -28,12 +25,12 @@ from .protocol import (
     make_heartbeat_message,
     make_register_message,
     make_result_message,
+    make_telemetry_message,
 )
+from .runner import RunConfig, TrainRunner, parse_final_metrics
+from .scaler import ParameterScaler
 
 logger = logging.getLogger(__name__)
-
-# Timeout for a single experiment (training + compile + eval overhead)
-EXPERIMENT_TIMEOUT = 900  # 15 minutes max
 
 
 class Worker:
@@ -65,8 +62,11 @@ class Worker:
         self.hardware = detect_hardware()
         self.status = "initializing"
         self.current_experiment: ExperimentSpec | None = None
-        self.current_process: subprocess.Popen | None = None
         self.ws = None
+
+        # Execution adapter and parameter scaler
+        self.runner = TrainRunner()
+        self.scaler = ParameterScaler()
 
         # Discovery and advertising
         self.advertiser = WorkerAdvertiser(
@@ -186,13 +186,13 @@ class Worker:
             exp_id = msg.payload.get("experiment_id")
             if self.current_experiment and self.current_experiment.experiment_id == exp_id:
                 logger.info(f"Cancelling experiment {exp_id}")
-                self._kill_current_process()
+                self.runner.cancel()
 
         elif msg.type == MessageType.COORDINATOR_ACK:
             logger.debug("Coordinator acknowledged")
 
     async def _run_experiment(self, spec: ExperimentSpec, ws):
-        """Execute a training experiment and report results."""
+        """Execute a training experiment via TrainRunner and report results."""
         self.current_experiment = spec
         self.status = "running"
 
@@ -201,92 +201,80 @@ class Worker:
 
         # Write train.py to experiment directory
         train_py = exp_dir / "train.py"
-        with open(train_py, "w") as f:
-            f.write(spec.train_py_content)
+        train_py.write_text(spec.train_py_content)
 
-        # Symlink prepare.py if not present (worker needs data access)
-        prepare_py = exp_dir / "prepare.py"
-        if not prepare_py.exists():
-            # Look for prepare.py in the repo directory
-            repo_prepare = Path(__file__).parent.parent / "prepare.py"
-            if repo_prepare.exists():
-                os.symlink(repo_prepare.resolve(), prepare_py)
-            else:
-                logger.warning("prepare.py not found — experiment may fail")
-
-        log_file = exp_dir / "run.log"
-        result = None
-
-        try:
-            logger.info(f"Starting experiment {spec.experiment_id[:8]}: {spec.description}")
-            t0 = time.time()
-
-            # Run uv run train.py in the experiment directory
-            self.current_process = subprocess.Popen(
-                ["uv", "run", "train.py"],
-                cwd=str(exp_dir),
-                stdout=open(log_file, "w"),
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "HF_HUB_DISABLE_PROGRESS_BARS": "1"},
+        # Compute scaled parameters if model config is available
+        env_overrides: dict[str, str] = {}
+        if spec.model_params_m > 0 and spec.depth > 0 and spec.n_embd > 0:
+            scaled = self.scaler.scale(
+                hardware=self.hardware,
+                model_params_m=spec.model_params_m,
+                depth=spec.depth,
+                n_embd=spec.n_embd,
+            )
+            env_overrides = scaled.to_env()
+            for w in scaled.warnings:
+                logger.warning(f"Scaler: {w}")
+            logger.info(
+                f"Scaled params: batch={scaled.device_batch_size} "
+                f"accum={scaled.grad_accum_steps} peak≈{scaled.estimated_peak_gb}GB"
             )
 
-            # Wait with timeout
-            try:
-                return_code = self.current_process.wait(timeout=EXPERIMENT_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                logger.warning(f"Experiment {spec.experiment_id[:8]} timed out")
-                self.current_process.kill()
-                self.current_process.wait()
-                result = ExperimentResult(
-                    experiment_id=spec.experiment_id,
-                    worker_id=self.worker_id,
-                    val_bpb=0.0,
-                    peak_vram_mb=0.0,
-                    training_seconds=0.0,
-                    total_seconds=time.time() - t0,
-                    total_tokens_m=0.0,
-                    num_steps=0,
-                    num_params_m=0.0,
-                    depth=0,
-                    status="timeout",
-                    error_message="Exceeded 15 minute timeout",
-                    train_py_content=spec.train_py_content,
-                    description=spec.description,
-                    worker_chip=self.hardware.chip,
-                    worker_memory_gb=self.hardware.total_memory_gb,
-                    worker_tier=self.hardware.tier,
-                )
-                await self._send_result(result, ws)
-                return
+        telemetry_path = exp_dir / "telemetry.jsonl"
+        config = RunConfig(
+            train_py_path=train_py,
+            work_dir=exp_dir,
+            env_overrides=env_overrides,
+            telemetry_path=telemetry_path,
+        )
 
-            # Parse output
-            total_seconds = time.time() - t0
+        result = None
+        try:
+            logger.info(f"Starting experiment {spec.experiment_id[:8]}: {spec.description}")
 
-            if return_code != 0:
-                # Read last 50 lines for error
-                error_lines = self._tail_file(log_file, 50)
-                result = ExperimentResult(
-                    experiment_id=spec.experiment_id,
-                    worker_id=self.worker_id,
-                    val_bpb=0.0,
-                    peak_vram_mb=0.0,
-                    training_seconds=0.0,
-                    total_seconds=total_seconds,
-                    total_tokens_m=0.0,
-                    num_steps=0,
-                    num_params_m=0.0,
-                    depth=0,
-                    status="crash",
-                    error_message=error_lines,
-                    train_py_content=spec.train_py_content,
-                    description=spec.description,
-                    worker_chip=self.hardware.chip,
-                    worker_memory_gb=self.hardware.total_memory_gb,
-                    worker_tier=self.hardware.tier,
-                )
+            loop = asyncio.get_event_loop()
+
+            def on_telemetry(batch: list[dict]):
+                msg = make_telemetry_message(spec.experiment_id, self.worker_id, batch)
+                try:
+                    asyncio.run_coroutine_threadsafe(ws.send(msg.to_json()), loop)
+                except Exception as ex:
+                    logger.debug(f"Failed to stream telemetry: {ex}")
+
+            run_result = await loop.run_in_executor(
+                None, lambda: self.runner.run(config, on_telemetry=on_telemetry)
+            )
+
+            # Map RunResult → ExperimentResult
+            m = run_result.metrics
+            if run_result.return_code == -1 and run_result.error and "cancel" in run_result.error.lower():
+                status = "cancelled"
+            elif run_result.return_code == -1 and run_result.error and "timeout" in run_result.error.lower():
+                status = "timeout"
+            elif run_result.return_code != 0 or m.get("val_bpb", 0) == 0:
+                status = "crash"
             else:
-                # Parse results from log
-                result = self._parse_results(log_file, spec, total_seconds)
+                status = "success"
+
+            result = ExperimentResult(
+                experiment_id=spec.experiment_id,
+                worker_id=self.worker_id,
+                val_bpb=m.get("val_bpb", 0.0),
+                peak_vram_mb=m.get("peak_vram_mb", 0.0),
+                training_seconds=m.get("training_seconds", 0.0),
+                total_seconds=run_result.elapsed_seconds,
+                total_tokens_m=m.get("total_tokens_M", 0.0),
+                num_steps=int(m.get("num_steps", 0)),
+                num_params_m=m.get("num_params_M", 0.0),
+                depth=int(m.get("depth", 0)),
+                status=status,
+                error_message=run_result.error or "",
+                train_py_content=spec.train_py_content,
+                description=spec.description,
+                worker_chip=self.hardware.chip,
+                worker_memory_gb=self.hardware.total_memory_gb,
+                worker_tier=self.hardware.tier,
+            )
 
         except Exception as e:
             logger.error(f"Experiment {spec.experiment_id[:8]} failed: {e}")
@@ -311,58 +299,10 @@ class Worker:
             )
         finally:
             self.current_experiment = None
-            self.current_process = None
             self.status = "idle"
 
         if result:
             await self._send_result(result, ws)
-
-    def _parse_results(self, log_file: Path, spec: ExperimentSpec, total_seconds: float) -> ExperimentResult:
-        """Parse training results from the log file."""
-        content = ""
-        try:
-            with open(log_file, "r") as f:
-                content = f.read()
-        except Exception:
-            pass
-
-        def extract(key: str, default: float = 0.0) -> float:
-            match = re.search(rf"^{key}:\s+([0-9.]+)", content, re.MULTILINE)
-            if match:
-                try:
-                    return float(match.group(1))
-                except ValueError:
-                    pass
-            return default
-
-        val_bpb = extract("val_bpb")
-        peak_vram_mb = extract("peak_vram_mb")
-        training_seconds = extract("training_seconds")
-        total_tokens_m = extract("total_tokens_M")
-        num_steps = int(extract("num_steps"))
-        num_params_m = extract("num_params_M")
-        depth = int(extract("depth"))
-
-        status = "success" if val_bpb > 0 else "crash"
-
-        return ExperimentResult(
-            experiment_id=spec.experiment_id,
-            worker_id=self.worker_id,
-            val_bpb=val_bpb,
-            peak_vram_mb=peak_vram_mb,
-            training_seconds=training_seconds,
-            total_seconds=total_seconds,
-            total_tokens_m=total_tokens_m,
-            num_steps=num_steps,
-            num_params_m=num_params_m,
-            depth=depth,
-            status=status,
-            train_py_content=spec.train_py_content,
-            description=spec.description,
-            worker_chip=self.hardware.chip,
-            worker_memory_gb=self.hardware.total_memory_gb,
-            worker_tier=self.hardware.tier,
-        )
 
     async def _send_result(self, result: ExperimentResult, ws):
         """Send experiment result to coordinator."""
@@ -376,28 +316,34 @@ class Worker:
         except Exception as e:
             logger.error(f"Failed to send result: {e}")
 
-    def _kill_current_process(self):
-        """Kill the currently running experiment process."""
-        if self.current_process:
-            try:
-                self.current_process.kill()
-                self.current_process.wait(timeout=10)
-            except Exception:
-                pass
-
-    @staticmethod
-    def _tail_file(path: Path, n: int = 50) -> str:
-        """Read last n lines of a file."""
-        try:
-            with open(path, "r") as f:
-                lines = f.readlines()
-            return "".join(lines[-n:])
-        except Exception:
-            return ""
+    def _parse_results(self, log_file: Path, spec: ExperimentSpec, runtime_seconds: float) -> ExperimentResult:
+        """Backward-compatible helper to parse results from a log file."""
+        stdout = log_file.read_text() if log_file.exists() else ""
+        m = parse_final_metrics(stdout)
+        status = "success" if m.get("val_bpb", 0) > 0 else "crash"
+        return ExperimentResult(
+            experiment_id=spec.experiment_id,
+            worker_id=self.worker_id,
+            val_bpb=m.get("val_bpb", 0.0),
+            peak_vram_mb=m.get("peak_vram_mb", 0.0),
+            training_seconds=m.get("training_seconds", 0.0),
+            total_seconds=runtime_seconds,
+            total_tokens_m=m.get("total_tokens_M", 0.0),
+            num_steps=int(m.get("num_steps", 0)),
+            num_params_m=m.get("num_params_M", 0.0),
+            depth=int(m.get("depth", 0)),
+            status=status,
+            error_message="",
+            train_py_content=spec.train_py_content,
+            description=spec.description,
+            worker_chip=self.hardware.chip,
+            worker_memory_gb=self.hardware.total_memory_gb,
+            worker_tier=self.hardware.tier,
+        )
 
     def stop(self):
         """Clean shutdown."""
-        self._kill_current_process()
+        self.runner.cancel()
         self.advertiser.stop()
         self.discovery.stop()
         logger.info("Worker stopped")

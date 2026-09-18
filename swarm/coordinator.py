@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 from pathlib import Path
@@ -22,8 +23,11 @@ from .protocol import (
     ExperimentSpec,
     Message,
     MessageType,
+    make_cancel_message,
     make_experiment_assign_message,
 )
+from .mutation import MutationEngine
+from .telemetry import PruningPolicy, StepMetrics, ThresholdPruner
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +85,35 @@ class Coordinator:
         repo_dir: str,
         port: int = 8765,
         max_concurrent: int = 0,
+        pruning_policy: PruningPolicy | None = None,
+        autonomous: bool = False,
+        max_generations: int = 10,
+        patience: int = 3,
+        mutations_per_batch: int = 0,
+        mutation_engine: MutationEngine | None = None,
     ):
         self.repo_dir = Path(repo_dir)
         self.port = port
         self.max_concurrent = max_concurrent  # 0 = unlimited
+        self.pruning_policy = (
+            pruning_policy if pruning_policy is not None else ThresholdPruner()
+        )
+        self.autonomous = autonomous
+        self.max_generations = max_generations
+        self.patience = patience
+        self.mutations_per_batch = mutations_per_batch
+        self.mutation_engine = mutation_engine or MutationEngine()
 
         self.workers: dict[str, WorkerState] = {}
         self.tracker = ExperimentTracker(str(self.repo_dir))
         self.advertiser = CoordinatorAdvertiser(port=self.port)
+        self.telemetry: dict[str, list[StepMetrics]] = {}
+
+        # Autonomous loop state
+        self.current_generation = 0
+        self.generations_without_improvement = 0
+        self.autonomous_task: asyncio.Task | None = None
+        self._last_best_val_bpb: float = float("inf")
 
         # WebSocket server
         self.server = None
@@ -120,6 +145,8 @@ class Coordinator:
 
         # Start background tasks
         asyncio.create_task(self._cleanup_loop())
+        if self.autonomous:
+            self.autonomous_task = asyncio.create_task(self._auto_research_loop())
 
         # Keep running
         await asyncio.Future()
@@ -161,6 +188,11 @@ class Coordinator:
                     elif msg.type == MessageType.EXPERIMENT_RESULT:
                         result = ExperimentResult.from_dict(msg.payload)
                         await self._handle_result(result)
+
+                    elif msg.type == MessageType.STEP_TELEMETRY:
+                        exp_id = msg.payload.get("experiment_id")
+                        raw_metrics = msg.payload.get("metrics", [])
+                        await self._handle_telemetry(exp_id, raw_metrics)
 
                     elif (
                         msg.type == MessageType.WORKER_STATUS
@@ -255,12 +287,145 @@ class Coordinator:
         # Try to assign more experiments
         await self._try_assign_experiments()
 
+    async def _handle_telemetry(self, exp_id: str, raw_metrics: list[dict]):
+        """Buffer step telemetry and evaluate speculative pruning."""
+        if not exp_id:
+            return
+        metrics = [StepMetrics.from_dict(m) for m in raw_metrics]
+        if exp_id not in self.telemetry:
+            self.telemetry[exp_id] = []
+        self.telemetry[exp_id].extend(metrics)
+
+        best_bpb = self.tracker.best_val_bpb or 0.0
+        if self.pruning_policy and self.pruning_policy.should_cancel(
+            self.telemetry[exp_id], best_bpb
+        ):
+            logger.info(
+                f"✂️ Pruning experiment {exp_id[:8]} (step metrics triggered policy)"
+            )
+            await self.cancel_experiment(exp_id)
+
+    async def cancel_experiment(self, experiment_id: str):
+        """Send cancellation message to the worker running the experiment."""
+        for worker in self.workers.values():
+            if worker.current_experiment_id == experiment_id:
+                cancel_msg = make_cancel_message(experiment_id)
+                try:
+                    await worker.ws.send(cancel_msg.to_json())
+                    logger.info(
+                        f"Sent cancel for {experiment_id[:8]} to worker {worker.worker_id}"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send cancel to {worker.worker_id}: {e}")
+                break
+
+
+    def _get_baseline_train_py(self) -> str:
+        """Read baseline train.py from repository."""
+        train_path = self.repo_dir / "train.py"
+        if train_path.exists():
+            return train_path.read_text()
+        return ""
+
+    async def _generate_next_batch(self) -> bool:
+        """Generate and queue the next batch of candidate mutations."""
+        if self.current_generation >= self.max_generations:
+            logger.info(
+                f"Autonomous Loop: Reached max generations ({self.max_generations}). Stopping."
+            )
+            return False
+
+        if self.generations_without_improvement >= self.patience:
+            logger.info(
+                f"Autonomous Loop: Patience exhausted ({self.patience} generations without improvement). Stopping."
+            )
+            return False
+
+        alive_workers = [w for w in self.workers.values() if w.is_alive]
+        if not alive_workers:
+            logger.warning("Autonomous Loop: No active workers connected. Waiting...")
+            return False
+
+        if self.mutations_per_batch > 0:
+            count = self.mutations_per_batch
+        else:
+            count = max(1, len(alive_workers))
+
+        base_content = self._get_baseline_train_py()
+        if not base_content:
+            logger.warning("Autonomous Loop: train.py not found in repo.")
+            return False
+
+        next_gen = self.current_generation + 1
+        candidates = self.mutation_engine.generate_batch(
+            base_content=base_content,
+            history=self.tracker.get_history(),
+            count=count,
+            generation=next_gen,
+            parent_experiment_id=self.tracker.best_experiment_id,
+        )
+
+        if not candidates:
+            logger.warning("Autonomous Loop: Failed to generate mutation candidates.")
+            return False
+
+        self.current_generation = next_gen
+        logger.info(
+            f"🔬 Autonomous Loop: Starting generation {self.current_generation} "
+            f"({len(candidates)} candidates, patience {self.generations_without_improvement}/{self.patience})"
+        )
+
+        for cand in candidates:
+            await self.submit_experiment(
+                description=cand.description,
+                train_py_content=cand.train_py_content,
+                generation=cand.generation,
+                parent_experiment_id=cand.parent_experiment_id,
+                mutation_type=cand.mutation_type,
+            )
+
+        return True
+
+    async def _auto_research_loop(self):
+        """Background loop driving autonomous hypothesis generation."""
+        logger.info("Autonomous research loop active")
+        await asyncio.sleep(2)
+
+        while True:
+            try:
+                queued = self.tracker.get_queued_experiments()
+                running = self.tracker.get_running_experiments()
+                alive_workers = [w for w in self.workers.values() if w.is_alive]
+
+                if alive_workers and not queued and not running:
+                    # Assess improvement from previous generation
+                    if self.current_generation > 0:
+                        if self.tracker.best_val_bpb < self._last_best_val_bpb:
+                            self._last_best_val_bpb = self.tracker.best_val_bpb
+                            self.generations_without_improvement = 0
+                        else:
+                            self.generations_without_improvement += 1
+
+                    can_continue = await self._generate_next_batch()
+                    if not can_continue:
+                        break
+
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in autonomous loop: {e}", exc_info=True)
+                await asyncio.sleep(5)
+
     async def submit_experiment(
         self,
         description: str,
         train_py_content: str,
         min_memory_gb: float = 0.0,
         preferred_tier: str = "",
+        generation: int = 0,
+        parent_experiment_id: str = "",
+        mutation_type: str = "",
     ) -> str:
         """Submit a new experiment to the queue. Returns experiment ID."""
         exp = self.tracker.create_experiment(
@@ -268,6 +433,9 @@ class Coordinator:
             train_py_content=train_py_content,
             min_memory_gb=min_memory_gb,
             preferred_tier=preferred_tier,
+            generation=generation,
+            parent_experiment_id=parent_experiment_id,
+            mutation_type=mutation_type,
         )
         logger.info(f"Queued experiment {exp.experiment_id[:8]}: {description}")
 
@@ -302,6 +470,11 @@ class Coordinator:
             worker.status = "busy"
             idle_workers.remove(worker)
 
+            depth_match = re.search(
+                r"^DEPTH\s*=\s*([0-9]+)", exp.train_py_content, re.MULTILINE
+            )
+            depth_val = int(depth_match.group(1)) if depth_match else 0
+
             spec = ExperimentSpec(
                 experiment_id=exp.experiment_id,
                 train_py_content=exp.train_py_content,
@@ -310,6 +483,7 @@ class Coordinator:
                 parent_commit=exp.parent_commit,
                 min_memory_gb=exp.min_memory_gb,
                 preferred_tier=exp.preferred_tier,
+                depth=depth_val,
             )
 
             msg = make_experiment_assign_message(spec)
@@ -393,6 +567,8 @@ class Coordinator:
 
     def stop(self):
         """Clean shutdown."""
+        if self.autonomous_task:
+            self.autonomous_task.cancel()
         if self.server:
             self.server.close()
         self.advertiser.stop()
@@ -404,12 +580,20 @@ async def run_coordinator(
     repo_dir: str,
     port: int = 8765,
     max_concurrent: int = 0,
+    autonomous: bool = False,
+    max_generations: int = 10,
+    patience: int = 3,
+    mutations_per_batch: int = 0,
 ):
     """Entry point to run the coordinator."""
     coordinator = Coordinator(
         repo_dir=repo_dir,
         port=port,
         max_concurrent=max_concurrent,
+        autonomous=autonomous,
+        max_generations=max_generations,
+        patience=patience,
+        mutations_per_batch=mutations_per_batch,
     )
 
     loop = asyncio.get_event_loop()

@@ -53,7 +53,19 @@ def main(verbose: bool):
 @click.option("--port", "-p", default=8765, help="WebSocket server port")
 @click.option("--repo-dir", "-d", default=".", help="Repository directory")
 @click.option("--max-concurrent", "-c", default=0, help="Max concurrent experiments (0=unlimited)")
-def coordinator(port: int, repo_dir: str, max_concurrent: int):
+@click.option("--autonomous/--no-autonomous", default=False, help="Enable autonomous hypothesis loop")
+@click.option("--max-generations", default=10, help="Max generations in autonomous loop")
+@click.option("--patience", default=3, help="Generations without improvement before stopping")
+@click.option("--mutations-per-batch", default=0, help="Mutations per batch (0 = worker count)")
+def coordinator(
+    port: int,
+    repo_dir: str,
+    max_concurrent: int,
+    autonomous: bool,
+    max_generations: int,
+    patience: int,
+    mutations_per_batch: int,
+):
     """Start the swarm coordinator.
 
     The coordinator manages the experiment queue, distributes work to
@@ -75,6 +87,9 @@ def coordinator(port: int, repo_dir: str, max_concurrent: int):
     banner.append(f"Port: {port}\n")
     banner.append(f"Repo: {repo_path}\n")
     banner.append(f"Max concurrent: {'unlimited' if max_concurrent == 0 else max_concurrent}\n")
+    banner.append(f"Autonomous: {'Enabled' if autonomous else 'Disabled'}\n")
+    if autonomous:
+        banner.append(f"Max generations: {max_generations} | Patience: {patience}\n")
     banner.append("\nWorkers will auto-discover via mDNS (Bonjour)", style="dim italic")
     console.print(Panel(banner, title="🐝 Swarm Coordinator", border_style="cyan"))
 
@@ -82,6 +97,10 @@ def coordinator(port: int, repo_dir: str, max_concurrent: int):
         repo_dir=str(repo_path),
         port=port,
         max_concurrent=max_concurrent,
+        autonomous=autonomous,
+        max_generations=max_generations,
+        patience=patience,
+        mutations_per_batch=mutations_per_batch,
     ))
 
 

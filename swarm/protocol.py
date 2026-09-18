@@ -18,6 +18,7 @@ class MessageType(str, Enum):
     WORKER_HEARTBEAT = "worker_heartbeat"
     EXPERIMENT_RESULT = "experiment_result"
     WORKER_STATUS = "worker_status"
+    STEP_TELEMETRY = "step_telemetry"
 
     # Coordinator -> Worker
     EXPERIMENT_ASSIGN = "experiment_assign"
@@ -56,6 +57,10 @@ class ExperimentSpec:
     # Hardware requirements
     min_memory_gb: float = 0.0
     preferred_tier: str = ""
+    # Model config for adaptive scaling (optional, 0 = unknown)
+    model_params_m: float = 0.0
+    depth: int = 0
+    n_embd: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -154,3 +159,17 @@ def make_cancel_message(experiment_id: str, coordinator_id: str = "coordinator")
         payload={"experiment_id": experiment_id},
         sender_id=coordinator_id,
     )
+
+
+def make_telemetry_message(experiment_id: str, worker_id: str, metrics: list[dict]) -> Message:
+    """Create a step telemetry message."""
+    return Message(
+        type=MessageType.STEP_TELEMETRY,
+        payload={
+            "experiment_id": experiment_id,
+            "worker_id": worker_id,
+            "metrics": metrics,
+        },
+        sender_id=worker_id,
+    )
+

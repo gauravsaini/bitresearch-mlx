@@ -5,6 +5,7 @@ Usage: uv run train.py
 """
 
 import gc
+import json
 import math
 import os
 import time
@@ -373,6 +374,12 @@ DEVICE_BATCH_SIZE = 16
 FINAL_EVAL_BATCH_SIZE = 256
 STARTUP_EXCLUDE_STEPS = 1
 
+# Allow swarm scaler to override per-worker via env vars
+DEPTH = int(os.environ.get("BITRESEARCH_DEPTH", DEPTH))
+DEVICE_BATCH_SIZE = int(os.environ.get("BITRESEARCH_DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE))
+TOTAL_BATCH_SIZE = int(os.environ.get("BITRESEARCH_TOTAL_BATCH_SIZE", TOTAL_BATCH_SIZE))
+
+
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -483,6 +490,24 @@ while True:
         end="",
         flush=True,
     )
+
+    telemetry_path = os.environ.get("BITRESEARCH_TELEMETRY_FILE")
+    if telemetry_path:
+        try:
+            with open(telemetry_path, "a") as tf:
+                json.dump({
+                    "step": step,
+                    "loss": round(float(debiased_smooth_loss), 6),
+                    "lr_multiplier": round(float(lrm), 4),
+                    "tokens_per_sec": float(tok_per_sec),
+                    "elapsed_seconds": round(float(total_training_time), 3),
+                    "peak_vram_mb": round(float(get_peak_memory_mb()), 1),
+                }, tf)
+                tf.write("\n")
+                tf.flush()
+        except Exception:
+            pass
+
 
     if step == 0:
         gc.collect()
