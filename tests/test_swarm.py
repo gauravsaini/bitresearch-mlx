@@ -23,7 +23,12 @@ import websockets
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+
 from swarm.coordinator import Coordinator
+from swarm.discovery import CoordinatorAdvertiser, ServiceDiscovery, WorkerAdvertiser
 from swarm.experiment import ExperimentTracker
 from swarm.hardware import detect_hardware
 from swarm.protocol import (
@@ -130,6 +135,73 @@ class TestHardwareDetection:
 
         hw.total_memory_gb = 16.0
         assert hw.tier == "base"
+
+
+class TestMLXExecution:
+    """Test actual MLX Metal GPU computation and training loop execution."""
+
+    def test_mlx_gpu_forward_backward(self):
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = nn.Linear(16, 32)
+                self.fc2 = nn.Linear(32, 4)
+
+            def __call__(self, x):
+                return self.fc2(nn.relu(self.fc1(x)))
+
+        model = TinyModel()
+        optimizer = optim.Adam(learning_rate=0.01)
+        x = mx.random.normal((8, 16))
+        y = mx.random.randint(0, 4, (8,))
+
+        loss_fn = nn.value_and_grad(
+            model,
+            lambda m, x_in, targets: mx.mean(nn.losses.cross_entropy(m(x_in), targets)),
+        )
+        loss0, _ = loss_fn(model, x, y)
+
+        for _ in range(5):
+            loss, grads = loss_fn(model, x, y)
+            optimizer.update(model, grads)
+            mx.eval(model.parameters(), optimizer.state)
+
+        loss_final, _ = loss_fn(model, x, y)
+        assert loss_final.item() < loss0.item()
+
+
+class TestMDNSDiscovery:
+    """Test Bonjour/mDNS service announcement and network discovery."""
+
+    def test_coordinator_and_worker_discovery(self):
+        adv_coord = CoordinatorAdvertiser(port=18780)
+        adv_coord.start()
+
+        adv_worker = WorkerAdvertiser(
+            port=18781,
+            worker_id="test-worker-mdns",
+            hardware_info={"chip": "Apple M1", "total_memory_gb": 8.0, "tier": "base"},
+        )
+        adv_worker.start()
+
+        disc = ServiceDiscovery()
+        disc.start()
+
+        try:
+            coord = disc.find_coordinator(timeout=5)
+            assert coord is not None, "Coordinator service not discovered via mDNS"
+            assert coord["port"] == 18780
+            assert coord["properties"].get("role") == "coordinator"
+
+            time.sleep(1)
+            workers = disc.find_workers()
+            assert len(workers) >= 1, "Worker service not discovered via mDNS"
+            worker_names = [w["name"] for w in workers]
+            assert any("test-worker-mdns" in name for name in worker_names)
+        finally:
+            adv_coord.stop()
+            adv_worker.stop()
+            disc.stop()
 
 
 class TestProtocol:
